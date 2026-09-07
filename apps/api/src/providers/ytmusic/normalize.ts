@@ -11,6 +11,7 @@
 // degrades to fewer results instead of 500s.
 
 import type { Album, Artist, Artwork, Playlist, Track, VideoItem } from '@zabify/shared';
+import { isVideoId } from '@zabify/shared';
 
 type Rec = Record<string, unknown>;
 
@@ -187,7 +188,11 @@ export function normalizeSongItem(raw: unknown): Track | null {
   if (!title) return null;
   const ep0 = flex.length > 0 ? endpointId((flex[0] as Rec)['endpoint']) : endpointId(node['endpoint']);
   const did = directId(node);
-  const id = ep0.videoId || (did.length === 11 ? did : '') || did;
+  // Only real video IDs are playable. Never fall back to playlist / browse /
+  // radio IDs (RDCLAK…/VL…/UC…/MPRE…): Up-Next and search `endpoint` rows can
+  // carry those, and queueing one poisons playback with a guaranteed 404
+  // (see audio resolve). When in doubt, drop the row instead of guessing.
+  const id = ep0.videoId && isVideoId(ep0.videoId) ? ep0.videoId : isVideoId(did) ? did : '';
   if (!id) return null;
   const sub = flex[1] ?? asRec(node['subtitle']);
   const artists = artistsFromRuns(sub, txt(sub));
@@ -199,7 +204,7 @@ export function normalizeSongItem(raw: unknown): Track | null {
     album: albumName ? { id: '', title: albumName } : undefined,
     durationSec: durationSecOf(node),
     artwork: thumbs(node['thumbnail'] ?? node['thumbnails']),
-    videoId: ep0.videoId ?? (id.length === 11 ? id : undefined) ?? id,
+    videoId: id,
   };
 }
 

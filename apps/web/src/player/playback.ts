@@ -1,4 +1,5 @@
 import type { Track } from '@zabify/shared';
+import { isVideoId } from '@zabify/shared';
 import { audioUrl, probeAudio, qualityChain } from '../lib/api';
 import { usePlayer } from '../stores/player';
 import { useQueue } from '../stores/queue';
@@ -183,6 +184,19 @@ function targetVolume(): number {
 
 async function resolveAndLoad(track: Track, token: number): Promise<void> {
   const el = ensureAudio();
+  // Non-video IDs (playlist/radio/browse IDs like RDCLAK…/VL…/UC…) can leak
+  // into queues from Up-Next/endpoint rows on older data — they can never
+  // resolve, so skip locally instead of burning a 404 + an auto-skip.
+  if (!isVideoId(track.id)) {
+    if (token !== streamToken) return;
+    console.warn('[zabify] skipping non-track id in queue', track.id);
+    noteResolveFailure(track.id, 'NON_TRACK_ID');
+    usePlayer.getState().setPlaying(false);
+    if (!noteFailure('resolve', track.id, 'NON_TRACK_ID')) return;
+    toast('That item is not a playable track — trying next track', 'error');
+    next(true);
+    return;
+  }
   let url: string;
   const offlineHit = gaplessPreload?.id === track.id ? null : await cachedUrl(track.id);
   if (gaplessPreload?.id === track.id) {
@@ -285,6 +299,7 @@ function fadeIn(el: HTMLAudioElement, to: number, ms: number): void {
 
 /** Silent preload: validate the stream URL and buffer without playing or toasting. */
 async function prefetch(track: Track, token: number): Promise<void> {
+  if (!isVideoId(track.id)) return; // non-track queue entry — nothing to preload
   const el = ensureAudio();
   // Probe first so a backend JSON error never touches el.src — otherwise the
   // global 'error' handler would auto-skip a track the user hasn't played.

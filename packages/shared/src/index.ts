@@ -207,3 +207,12 @@ export const DEFAULT_SETTINGS: UserSettings = {
 export function apiError(code: string, message: string, details?: unknown): ApiErrorBody {
   return { error: { code, message, details } };
 }
+
+/**
+ * True for real playable YouTube video IDs (always exactly 11 chars of
+ * alnum/`-`/`_`). Playlist/radio/browse IDs (RDCLAK…/VL…/UC…/MPRE…)
+ * are longer and must never enter the playback queue as tracks.
+ */
+export function isVideoId(id: string): boolean {
+  return /^[A-Za-z0-9_-]{11}$/.test(id);
+}
