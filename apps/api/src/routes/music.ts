@@ -80,7 +80,25 @@ export async function musicRoutes(app: FastifyInstance, env: Env): Promise<void>
           'YouTube is blocking or rate-limiting this server. Retry, lower quality, or set YTDLP_COOKIES.',
         );
       }
-      return sendError(reply, 404, 'TRACK_UNAVAILABLE', 'The requested track is currently unavailable.');
+      // Same disambiguation as /audio: a generic resolve failure with
+      // existing metadata is server-side (502), not a missing track (404).
+      try {
+        await Promise.race([
+          provider.getTrack(p.data.id),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('VERIFY_TIMEOUT')), 10000)),
+        ]);
+        return sendError(
+          reply,
+          502,
+          'AUDIO_FAILED',
+          'Audio could not be resolved even though this track exists. The server is likely blocked — retry, lower quality, or ask the host to set YTDLP_COOKIES.',
+        );
+      } catch (verifyErr) {
+        if (verifyErr instanceof Error && verifyErr.message === 'VERIFY_TIMEOUT') {
+          return sendError(reply, 502, 'AUDIO_FAILED', 'Audio server is warming up or busy — press play to retry');
+        }
+        return sendError(reply, 404, 'TRACK_UNAVAILABLE', 'The requested track is currently unavailable.');
+      }
     }
   });
 

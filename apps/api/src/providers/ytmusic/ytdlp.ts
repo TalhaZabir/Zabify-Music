@@ -134,7 +134,10 @@ async function resolveOnce(
 ): Promise<YtDlpResolution> {
   const python = process.env.PYTHON_BIN ?? 'python';
   const timeoutMs = Number(process.env.YTDLP_TIMEOUT_MS ?? 25000);
-  const url = `https://music.youtube.com/watch?v=${trackId}`;
+  // www.youtube.com (not music.youtube.com): identical video IDs, but the
+  // main-site player is yt-dlp's most-tested path and is challenged less
+  // often on datacenter IPs than the music-specific player.
+  const url = `https://www.youtube.com/watch?v=${trackId}`;
   const args = [
     '-m',
     'yt_dlp',
@@ -307,7 +310,7 @@ export function isUpstreamBlocked(err: unknown): boolean {
 /** True when yt-dlp is missing/misconfigured (distinct from blocked vs gone). */
 export function isYtDlpMissing(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err ?? '');
-  return /ytdlp-missing|ytdlp disabled/i.test(msg);
+  return /ytdlp-missing|yt-?dlp disabled/i.test(msg);
 }
 
 /**

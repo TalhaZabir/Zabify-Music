@@ -115,6 +115,24 @@ export function seek(ms: number): void {
   }
 }
 
+/** Recent resolve failures across tracks — detects a systemic server issue
+ * misreported as per-track 404s (every track "unavailable" = server blocked,
+ * not 3 bad tracks in a row). */
+const recentResolveFailures: { trackId: string; code?: string }[] = [];
+
+function noteResolveFailure(trackId: string, code?: string): void {
+  recentResolveFailures.push({ trackId, code });
+  if (recentResolveFailures.length > 5) recentResolveFailures.shift();
+}
+
+/** True when several DIFFERENT tracks all failed recently — server-side. */
+function isSystemicFailure(): boolean {
+  if (recentResolveFailures.length < 3) return false;
+  const last3 = recentResolveFailures.slice(-3);
+  const ids = new Set(last3.map((f) => f.trackId));
+  return ids.size >= 3;
+}
+
 /** A failure the engine can recover from by skipping. Returns false when the circuit breaker trips. */
 function noteFailure(kind: 'resolve' | 'media', trackId: string, detail?: string): boolean {
   consecutiveFailures += 1;
@@ -122,7 +140,12 @@ function noteFailure(kind: 'resolve' | 'media', trackId: string, detail?: string
   if (consecutiveFailures > MAX_AUTO_SKIP) {
     consecutiveFailures = 0;
     usePlayer.getState().setPlaying(false);
-    toast('Playback keeps failing — check your connection, then press play', 'error');
+    toast(
+      isSystemicFailure()
+        ? 'Every track is failing — the audio server is likely blocked. Ask the host to check /api/diag/selftest and set YTDLP_COOKIES.'
+        : 'Playback keeps failing — check your connection, then press play',
+      'error',
+    );
     return false;
   }
   return true;
@@ -200,18 +223,28 @@ async function resolveAndLoad(track: Track, token: number): Promise<void> {
     if (!resolved) {
       if (token !== streamToken) return;
       usePlayer.getState().setPlaying(false);
-      // AUDIO_BLOCKED / AUDIO_CONFIG / warming-up / timeout errors are
-      // server-wide: stop the auto-skip cascade so every track doesn't burn
-      // one skip each.
+      noteResolveFailure(track.id, lastCode);
+      // AUDIO_BLOCKED / AUDIO_CONFIG / AUDIO_FAILED / warming-up / timeout
+      // errors are server-wide: stop the auto-skip cascade so every track
+      // doesn't burn one skip each. Repeated TRACK_UNAVAILABLE across
+      // different tracks is also systemic (server misreporting a block).
+      const systemic404 = lastCode === 'TRACK_UNAVAILABLE' && isSystemicFailure();
       if (
         lastCode === 'AUDIO_BLOCKED' ||
         lastCode === 'AUDIO_CONFIG' ||
+        lastCode === 'AUDIO_FAILED' ||
         lastTimedOut ||
-        /warming up or busy|taking too long|misconfigured/.test(lastMessage)
+        systemic404 ||
+        /warming up or busy|taking too long|misconfigured|even though this track exists/.test(lastMessage)
       ) {
         consecutiveFailures = MAX_AUTO_SKIP;
       }
-      toast(lastMessage, 'error');
+      toast(
+        systemic404
+          ? 'Every track is failing — the audio server is likely blocked. Ask the host to check /api/diag/selftest and set YTDLP_COOKIES.'
+          : lastMessage,
+        'error',
+      );
       return;
     }
     url = resolved;

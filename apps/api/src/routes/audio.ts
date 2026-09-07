@@ -96,8 +96,23 @@ async function cachedGetStream(
   return task;
 }
 
-/** Map resolve failures to the right public status (parity for HEAD + GET). */
-function resolveErrorReply(reply: FastifyReply, e: unknown) {
+/**
+ * Map resolve failures to the right public status (parity for HEAD + GET).
+ *
+ * Critical disambiguation: a generic resolve failure (e.g. "innertube-no-url
+ * | ytdlp-failed") does NOT prove the track is gone — on datacenter IPs it
+ * almost always means the *server* is flagged while the track exists. So
+ * before returning 404 we verify the track metadata still resolves: if
+ * getTrack succeeds, the track exists and this is a server-side failure
+ * (502); only if metadata is also gone do we return 404.
+ */
+async function resolveErrorReply(
+  app: FastifyInstance,
+  reply: FastifyReply,
+  provider: YouTubeMusicProvider,
+  trackId: string,
+  e: unknown,
+) {
   if (isYtDlpMissing(e)) {
     return sendError(
       reply,
@@ -114,7 +129,31 @@ function resolveErrorReply(reply: FastifyReply, e: unknown) {
       'YouTube is blocking or rate-limiting this server. Retry, lower quality, or set YTDLP_COOKIES.',
     );
   }
-  return sendError(reply, 404, 'TRACK_UNAVAILABLE', 'The requested track is currently unavailable.');
+  // Generic failure: check whether the track itself still exists.
+  try {
+    await Promise.race([
+      provider.getTrack(trackId),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('VERIFY_TIMEOUT')), 10000)),
+    ]);
+    // Metadata resolves but audio doesn't => server-side, not a bad id.
+    // Include the stage detail so the browser Network tab stays diagnosable.
+    const detail = resolveDetail(e);
+    app.log.warn({ trackId, detail }, 'audio resolve failed but track exists — server-side');
+    void reply.header('x-resolve-error', detail || 'audio-failed-track-exists');
+    void reply.header('Access-Control-Expose-Headers', 'x-resolve-error');
+    return sendError(
+      reply,
+      502,
+      'AUDIO_FAILED',
+      'Audio could not be resolved even though this track exists. The server is likely blocked — retry, lower quality, or ask the host to set YTDLP_COOKIES.',
+    );
+  } catch (verifyErr) {
+    if (verifyErr instanceof Error && verifyErr.message === 'VERIFY_TIMEOUT') {
+      app.log.warn({ trackId }, 'audio resolve failed and track verify timed out — treating as server-side');
+      return sendError(reply, 502, 'AUDIO_FAILED', 'Audio server is warming up or busy — press play to retry');
+    }
+    return sendError(reply, 404, 'TRACK_UNAVAILABLE', 'The requested track is currently unavailable.');
+  }
 }
 
 export async function audioRoutes(app: FastifyInstance): Promise<void> {
@@ -132,7 +171,7 @@ export async function audioRoutes(app: FastifyInstance): Promise<void> {
       app.log.error({ err: toSafeMessage(e), trackId: p.data.id }, 'audio probe resolve failed');
       void reply.header('x-resolve-error', resolveDetail(e));
       void reply.header('Access-Control-Expose-Headers', 'x-resolve-error');
-      return resolveErrorReply(reply, e);
+      return resolveErrorReply(app, reply, provider, p.data.id, e);
     }
     try {
       const probe = await fetchUpstream(stream.url, 'bytes=0-0');
@@ -171,8 +210,8 @@ export async function audioRoutes(app: FastifyInstance): Promise<void> {
       void reply.header('Access-Control-Expose-Headers', 'x-resolve-error');
       // A blocked/misconfigured server is NOT a missing track: 502 tells
       // the client to explain cookies/region instead of skipping blindly.
-      // Plain 404 stays for genuinely unavailable tracks.
-      return resolveErrorReply(reply, e);
+      // Plain 404 stays for genuinely unavailable tracks (verified below).
+      return resolveErrorReply(app, reply, provider, p.data.id, e);
     }
 
     const range = req.headers.range;
