@@ -29,7 +29,6 @@ services:
   - type: web
     name: zabify-web
     runtime: static
-    plan: free
     buildCommand: npm ci && npm run build -w packages/shared && npm run build -w apps/web
     staticPublishPath: ./apps/web/dist
     envVars:
