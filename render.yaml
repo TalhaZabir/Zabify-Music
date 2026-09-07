@@ -1,0 +1,37 @@
+# Zabify on Render's free tier — API + frontend in one blueprint.
+# Click "New +" -> "Blueprint" in Render and point it at this repo.
+#
+# Notes:
+# - The API sleeps after ~15 min idle (free-tier limit). First request
+#   after sleep takes 30-60s to wake; just retry once.
+# - Render injects $PORT automatically — do NOT set it here.
+# - After both services deploy, set CORS_ORIGIN on the API to the web URL.
+services:
+  - type: web
+    name: zabify-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./apps/api/Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: CORS_ORIGIN
+        sync: false
+      - key: YTDLP_ENABLED
+        value: "true"
+      - key: PYTHON_BIN
+        value: python3
+      - key: LOG_LEVEL
+        value: info
+
+  - type: web
+    name: zabify-web
+    runtime: static
+    plan: free
+    buildCommand: npm ci && npm run build -w packages/shared && npm run build -w apps/web
+    staticPublishPath: ./apps/web/dist
+    envVars:
+      - key: VITE_API_BASE_URL
+        sync: false

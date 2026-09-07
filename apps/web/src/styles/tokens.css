@@ -1,0 +1,45 @@
+:root {
+  /* Zabify design tokens — single source of truth, no ad-hoc values in components */
+  --bg-base: #0a0a0a;
+  --bg-raised: #121212;
+  --bg-overlay: #181818;
+  --text-primary: #f5f5f4;
+  --text-secondary: #a3a3a3;
+  --text-tertiary: #6b7280;
+  --accent: #2dd4bf;
+  --accent-soft: rgba(45, 212, 191, 0.14);
+  --border-subtle: rgba(255, 255, 255, 0.08);
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+  --shadow-soft: 0 8px 24px rgba(0, 0, 0, 0.35);
+  --shadow-lift: 0 16px 48px rgba(0, 0, 0, 0.45);
+  --blur-glass: 16px;
+  --dur-fast: 120ms;
+  --dur-base: 200ms;
+  --dur-slow: 320ms;
+  --z-header: 30;
+  --z-player: 40;
+  --z-menu: 60;
+  --z-modal: 80;
+  --z-toast: 100;
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+html[data-background='pure-black'] { --bg-base: #000; --bg-raised: #0a0a0a; --bg-overlay: #111; }
+html[data-background='near-black'] { --bg-base: #0a0a0a; --bg-raised: #121212; --bg-overlay: #181818; }
+html[data-background='dark-gray'] { --bg-base: #141414; --bg-raised: #1c1c1c; --bg-overlay: #242424; }
+html[data-background='glass'] { --bg-base: rgba(10,10,10,0.82); --bg-raised: rgba(18,18,18,0.72); --bg-overlay: rgba(24,24,24,0.66); }
+
+html, body, #root { height: 100%; }
+body {
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}

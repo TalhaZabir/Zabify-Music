@@ -1,0 +1,28 @@
+{
+  "name": "@zabify/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.3.0",
+    "@fastify/rate-limit": "^10.2.2",
+    "fastify": "^5.2.1",
+    "pino": "^9.6.0",
+    "youtubei.js": "^18.0.0",
+    "zod": "^3.23.8",
+    "@zabify/shared": "0.1.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "~5.6.3",
+    "vitest": "^2.1.8",
+    "@types/node": "^22.10.2"
+  }
+}

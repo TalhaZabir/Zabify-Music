@@ -1,0 +1,32 @@
+{
+  "name": "zabify",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Zabify — open-source YouTube Music streaming client",
+  "type": "module",
+  "license": "Apache-2.0",
+  "packageManager": "npm@11.12.1",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n web,api -c cyan,magenta \"npm run dev -w apps/web\" \"npm run dev -w apps/api\"",
+    "dev:web": "npm run dev -w apps/web",
+    "dev:api": "npm run dev -w apps/api",
+    "build": "npm run build -w packages/shared && npm run build -w apps/api && npm run build -w apps/web",
+    "typecheck": "npm run typecheck -w packages/shared && npm run typecheck -w apps/api && npm run typecheck -w apps/web",
+    "lint": "eslint . --max-warnings 0",
+    "test": "npm run test -w packages/shared --if-present && npm run test -w apps/api --if-present && npm run test -w apps/web --if-present",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "concurrently": "^9.1.2",
+    "eslint": "^9.18.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "prettier": "^3.4.2",
+    "typescript": "~5.6.3",
+    "typescript-eslint": "^8.69.0"
+  }
+}

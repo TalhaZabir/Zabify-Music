@@ -1,0 +1,29 @@
+# Zabify production stack. Stream URLs are IP-bound: keep the API on the
+# same network as its listeners, or put both services behind one host.
+services:
+  api:
+    build: { context: ., dockerfile: apps/api/Dockerfile }
+    ports: ["8788:8788"]
+    environment:
+      PORT: 8788
+      HOST: 0.0.0.0
+      CORS_ORIGIN: http://localhost:8080
+      YTDLP_ENABLED: "true"
+      PYTHON_BIN: python3
+      # LASTFM_API_KEY: ""
+      # LASTFM_API_SECRET: ""
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8788/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args: { VITE_API_BASE_URL: /api }
+    ports: ["8080:80"]
+    depends_on: [api]
+    restart: unless-stopped
