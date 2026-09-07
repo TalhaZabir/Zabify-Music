@@ -34,3 +34,5 @@ services:
     envVars:
       - key: VITE_API_BASE_URL
         sync: false
+      - key: NODE_VERSION
+        value: "24"
