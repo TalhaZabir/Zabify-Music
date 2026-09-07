@@ -5,7 +5,14 @@
 # - The API sleeps after ~15 min idle (free-tier limit). First request
 #   after sleep takes 30-60s to wake; just retry once.
 # - Render injects $PORT automatically — do NOT set it here.
-# - After both services deploy, set CORS_ORIGIN on the API to the web URL.
+# - After both services deploy, set CORS_ORIGIN on the API to the web URL
+#   (e.g. https://zabify-web.onrender.com) and redeploy the API.
+# - Set VITE_API_BASE_URL on the WEB service to the API URL + /api
+#   (e.g. https://zabify-api.onrender.com/api), then MANUAL REDEPLOY the
+#   web service — Vite bakes this value in at build time.
+# - Playback debugging: open https://<api>/api/diag — ytdlp.installed must
+#   be true. If tracks 404 with "bot challenge", set YTDLP_COOKIES (paste a
+#   fresh YouTube cookies.txt body as a secret file env var).
 services:
   - type: web
     name: zabify-api
@@ -23,8 +30,19 @@ services:
         value: "true"
       - key: PYTHON_BIN
         value: python3
+      - key: YTDLP_TIMEOUT_MS
+        value: "45000"
       - key: LOG_LEVEL
         value: info
+      # Optional reliability upgrades (all sync:false — set in dashboard):
+      # - key: YTDLP_COOKIES
+      #   sync: false
+      # - key: YT_PO_TOKEN
+      #   sync: false
+      # - key: YT_COOKIE
+      #   sync: false
+      # - key: YT_VISITOR_DATA
+      #   sync: false
 
   - type: web
     name: zabify-web

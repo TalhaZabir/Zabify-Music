@@ -45,10 +45,25 @@ export class YouTubeMusicProvider implements MusicProvider {
   private async client(): Promise<Innertube> {
     if (this.yt) return this.yt;
     if (!this.initPromise) {
-      this.initPromise = Innertube.create({
+      const sessionOpts: Record<string, string | undefined> = {
         lang: process.env.YTMUSIC_LANG ?? 'en',
         location: process.env.YTMUSIC_COUNTRY ?? 'US',
-      }).then((c) => (this.yt = c));
+      };
+      // Optional hardening for datacenter IPs. All are best-effort: when
+      // unset, youtubei.js generates a fresh anonymous session as before.
+      // YT_PO_TOKEN: session-bound proof-of-origin token (bypasses SABR).
+      // YT_VISITOR_DATA: persistent visitor id for tailored content.
+      // YT_COOKIE: full "SAPISID=...; ..." login cookie (highest reliability).
+      // YT_USER_AGENT: override the InnerTube UA (must match PO token issuer).
+      const poToken = (process.env.YT_PO_TOKEN ?? '').trim();
+      const visitorData = (process.env.YT_VISITOR_DATA ?? '').trim();
+      const cookie = (process.env.YT_COOKIE ?? '').trim();
+      const userAgent = (process.env.YT_USER_AGENT ?? '').trim();
+      if (poToken) sessionOpts['po_token'] = poToken;
+      if (visitorData) sessionOpts['visitor_data'] = visitorData;
+      if (cookie) sessionOpts['cookie'] = cookie;
+      if (userAgent) sessionOpts['user_agent'] = userAgent;
+      this.initPromise = Innertube.create(sessionOpts).then((c) => (this.yt = c));
     }
     return this.initPromise;
   }
@@ -392,58 +407,83 @@ export class YouTubeMusicProvider implements MusicProvider {
     assertId(trackId);
     if (!/^[A-Za-z0-9_-]{5,32}$/u.test(trackId)) throw new Error('TRACK_UNAVAILABLE');
     // Fast path: Innertube decipher (no subprocess).
+    let innertubeErr: unknown = null;
     try {
       const fast = await this.getStreamViaInnertube(trackId, options);
       if (fast) return fast;
-    } catch {
+      innertubeErr = new Error('INNERTUBE_NO_URL');
+    } catch (e) {
+      innertubeErr = e;
       // fall through to yt-dlp
     }
     if (ytDlpEnabled()) {
       try {
         const { url, expiresAt } = await resolveWithYtDlp(trackId, options);
         return { trackId, url, mimeType: 'audio/mp4', expiresAt };
-      } catch {
-        // fall through to unavailable
+      } catch (e) {
+        // Preserve both stages for route-level logging. The public error
+        // stays generic (TRACK_UNAVAILABLE) to avoid leaking internals.
+        const detail = [toStage(innertubeErr), toStage(e)].filter(Boolean).join(' | ');
+        throw new Error(detail ? `TRACK_UNAVAILABLE (${detail})` : 'TRACK_UNAVAILABLE');
       }
     }
-    throw new Error('TRACK_UNAVAILABLE');
+    throw new Error(`TRACK_UNAVAILABLE (${toStage(innertubeErr) || 'yt-dlp disabled'})`);
   }
 
   private async getStreamViaInnertube(trackId: string, options?: StreamOptions): Promise<StreamInfo | null> {
     const yt = await this.client();
-    let info;
-    try {
-      info = await withTimeout(20000, () => yt.getBasicInfo(trackId));
-    } catch {
-      return null;
-    }
-    const quality = options?.quality ?? 'auto';
-    let fmt;
-    try {
-      // youtubei.js v18+: quality is 'best' | 'bestefficiency' | itag label.
-      // Audio itags: 139 ≈ 48k, 140 ≈ 128k m4a, 251 ≈ opus high.
-      fmt =
-        quality === 'low'
-          ? info.chooseFormat({ type: 'audio', itag: 139 })
-          : quality === 'medium'
-            ? info.chooseFormat({ type: 'audio', itag: 140 })
-            : info.chooseFormat({ type: 'audio', quality: 'best' });
-    } catch {
+    const poToken = (process.env.YT_PO_TOKEN ?? '').trim() || undefined;
+    // Try the default client first, then explicit fallbacks. ANDROID-class
+    // clients historically return non-SABR URLs that decipher without a
+    // PO token; WEB needs one. Order matters for quality + reliability.
+    const clients = [undefined, 'ANDROID', 'YTMUSIC_ANDROID', 'WEB'] as const;
+    let lastErr: unknown = null;
+    for (const client of clients) {
+      let info;
       try {
-        fmt = info.chooseFormat({ type: 'audio', quality: 'best' });
-      } catch {
-        return null;
+         
+        info = await withTimeout(20000, () =>
+          yt.getBasicInfo(trackId, { ...(client ? { client } : {}), ...(poToken ? { po_token: poToken } : {}) }),
+        );
+      } catch (e) {
+        lastErr = e;
+        continue;
+      }
+      const quality = options?.quality ?? 'auto';
+      let fmt;
+      try {
+        // youtubei.js v18+: quality is 'best' | 'bestefficiency' | itag label.
+        // Audio itags: 139 ≈ 48k, 140 ≈ 128k m4a, 251 ≈ opus high.
+        fmt =
+          quality === 'low'
+            ? info.chooseFormat({ type: 'audio', itag: 139 })
+            : quality === 'medium'
+              ? info.chooseFormat({ type: 'audio', itag: 140 })
+              : info.chooseFormat({ type: 'audio', quality: 'best' });
+      } catch (e) {
+        try {
+          fmt = info.chooseFormat({ type: 'audio', quality: 'best' });
+        } catch (e2) {
+          lastErr = e2 ?? e;
+          continue;
+        }
+      }
+      try {
+         
+        const url: string = await withTimeout(15000, () => fmt.decipher(yt.session.player));
+        if (!url) {
+          lastErr = new Error('INNERTUBE_EMPTY_URL');
+          continue;
+        }
+        // Never cache beyond expiry — caller must treat as short-lived.
+        return { trackId, url, mimeType: fmt.mime_type, bitrate: fmt.bitrate, expiresAt: Date.now() + 5 * 60_000 };
+      } catch (e) {
+        lastErr = e;
+        continue;
       }
     }
-    let url: string;
-    try {
-      url = await withTimeout(15000, () => fmt.decipher(yt.session.player));
-    } catch {
-      return null;
-    }
-    if (!url) return null;
-    // Never cache beyond expiry — caller must treat as short-lived.
-    return { trackId, url, mimeType: fmt.mime_type, bitrate: fmt.bitrate, expiresAt: Date.now() + 5 * 60_000 };
+    if (lastErr) throw lastErr;
+    return null;
   }
 }
 
@@ -486,5 +526,25 @@ function parseYear(s: string): number | undefined {
 
 function assertId(id: string): void {
   if (!id || /[<>"]/u.test(id) || id.length > 128) throw new Error('INVALID_ID');
+}
+
+/** Collapse stage errors to a short, log-safe token (no URLs/cookies). */
+function toStage(e: unknown): string {
+  if (!e) return '';
+  const msg = e instanceof Error ? e.message : String(e);
+  const head = msg.split('\n')[0]?.slice(0, 160) ?? '';
+  if (/UPSTREAM_TIMEOUT/.test(head)) return 'innertube-timeout';
+  if (/No valid URL to decipher|INNERTUBE_NO_URL|INNERTUBE_EMPTY_URL/.test(head)) return 'innertube-no-url';
+  if (/YTDLP_FAILED/.test(head)) {
+    if (/bot/i.test(head)) return 'ytdlp-bot-challenge';
+    if (/timed out|ETIMEDOUT|timeout/i.test(head)) return 'ytdlp-timeout';
+    if (/No module named|not found|ENOENT/i.test(head)) return 'ytdlp-missing';
+    return 'ytdlp-failed';
+  }
+  if (/YTDLP_NO_URL/.test(head)) return 'ytdlp-no-url';
+  if (/400/.test(head)) return 'innertube-400';
+  if (/403/.test(head)) return 'upstream-403';
+  if (/429/.test(head)) return 'rate-limited';
+  return head.replace(/[^A-Za-z0-9-_:. ]/g, '').slice(0, 80) || 'failed';
 }
 

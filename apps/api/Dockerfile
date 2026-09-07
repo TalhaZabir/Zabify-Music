@@ -20,4 +20,7 @@ COPY --from=build /app/apps/api/dist apps/api/dist
 COPY --from=build /app/apps/api/package.json apps/api/
 COPY --from=build /app/node_modules node_modules
 EXPOSE 8788
-CMD ["node", "apps/api/dist/index.js"]
+# Refresh yt-dlp on every boot: YouTube breaks pinned versions within weeks,
+# and Render free-tier images can sit undeployed for months. Best-effort —
+# the API still starts if the upgrade fails (offline mirror, etc.).
+CMD ["sh", "-c", "pip install -q --break-system-packages -U yt-dlp >/dev/null 2>&1 || true; node apps/api/dist/index.js"]

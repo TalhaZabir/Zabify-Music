@@ -60,7 +60,7 @@ export async function musicRoutes(app: FastifyInstance, env: Env): Promise<void>
       const s = await provider.getStream(p.data.id, { quality: qs.data.quality });
       return reply.send(s);
     } catch (e) {
-      app.log.error({ err: toSafeMessage(e) }, 'stream failed');
+      app.log.error({ err: toSafeMessage(e), trackId: p.data.id }, 'stream failed');
       return sendError(reply, 404, 'TRACK_UNAVAILABLE', 'The requested track is currently unavailable.');
     }
   });

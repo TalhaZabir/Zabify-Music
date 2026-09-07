@@ -1,5 +1,5 @@
 import type { Track } from '@zabify/shared';
-import { api } from '../lib/api';
+import { audioUrl, probeAudio, qualityChain } from '../lib/api';
 import { usePlayer } from '../stores/player';
 import { useQueue } from '../stores/queue';
 import { useSettings } from '../stores/settings';
@@ -168,15 +168,41 @@ async function resolveAndLoad(track: Track, token: number): Promise<void> {
   } else if (offlineHit) {
     url = offlineHit; // offline cache hit — no network needed
   } else {
-    try {
-      const stream = await api.stream(track.id, useSettings.getState().quality);
-      url = stream.url;
-    } catch {
+    // Probe the audio endpoint across the quality chain before handing a
+    // URL to <audio>. Backend JSON errors would otherwise surface as opaque
+    // MEDIA_ERR_SRC_NOT_SUPPORTED and trigger blind auto-skips.
+    const chain = qualityChain(useSettings.getState().quality);
+    let resolved: string | null = null;
+    let lastMessage = 'That track is unavailable right now';
+    let lastCode: string | undefined;
+    for (const q of chain) {
+      if (token !== streamToken) return; // superseded while probing
+       
+      const probe = await probeAudio(track.id, q);
+      if (probe.ok) {
+        resolved = probe.url;
+        break;
+      }
+      lastMessage = probe.message;
+      lastCode = probe.code;
+      // CORS-unknown: <audio> (no-CORS) may still play — try direct.
+      if (probe.corsUnknown) {
+        resolved = audioUrl(track.id, q);
+        break;
+      }
+      // Permanent per-track failures: don't burn time on lower qualities.
+      if (probe.code === 'TRACK_UNAVAILABLE' || probe.status === 404 || probe.code === 'HTML_RESPONSE') break;
+    }
+    if (!resolved) {
       if (token !== streamToken) return;
       usePlayer.getState().setPlaying(false);
-      toast('That track is unavailable right now', 'error');
+      // AUDIO_BLOCKED / warming-up errors are server-wide: stop the
+      // auto-skip cascade so every track doesn't burn one skip each.
+      if (lastCode === 'AUDIO_BLOCKED' || /warming up or busy/.test(lastMessage)) consecutiveFailures = MAX_AUTO_SKIP;
+      toast(lastMessage, 'error');
       return;
     }
+    url = resolved;
   }
   if (token !== streamToken) return; // superseded while resolving
   el.src = url;
@@ -212,13 +238,23 @@ function fadeIn(el: HTMLAudioElement, to: number, ms: number): void {
   requestAnimationFrame(step);
 }
 
-/** Silent preload: fetch the stream URL and buffer without playing or toasting. */
+/** Silent preload: validate the stream URL and buffer without playing or toasting. */
 async function prefetch(track: Track, token: number): Promise<void> {
   const el = ensureAudio();
+  // Probe first so a backend JSON error never touches el.src — otherwise the
+  // global 'error' handler would auto-skip a track the user hasn't played.
+  const probe = await probeAudio(track.id, useSettings.getState().quality);
+  if (token !== streamToken) return;
+  if (!probe.ok) {
+    if (probe.corsUnknown) {
+      el.src = audioUrl(track.id, useSettings.getState().quality);
+      el.playbackRate = usePlayer.getState().rate;
+      el.load();
+    }
+    return;
+  }
   try {
-    const stream = await api.stream(track.id, useSettings.getState().quality);
-    if (token !== streamToken) return;
-    el.src = stream.url;
+    el.src = probe.url;
     el.playbackRate = usePlayer.getState().rate;
     el.load();
   } catch {
@@ -260,8 +296,9 @@ export function bindAudioEngine(): () => void {
     if (!item || item.track.id === usePlayer.getState().track?.id) return;
     preloading = true;
     try {
-      const stream = await api.stream(item.track.id, useSettings.getState().quality);
-      if (!gaplessPreload) gaplessPreload = { id: item.track.id, url: stream.url };
+      // Probe-validate so a broken preload never poisons gapless playback.
+      const probe = await probeAudio(item.track.id, useSettings.getState().quality);
+      if (!gaplessPreload && probe.ok) gaplessPreload = { id: item.track.id, url: probe.url };
     } catch {
       // Silent — normal resolve path retries on advance.
     } finally {
@@ -293,11 +330,26 @@ export function bindAudioEngine(): () => void {
   };
   const onError = (): void => {
     if (!el.src) return;
-    const code = el.error ? `MEDIA_ERR_${el.error.code}` : 'unknown';
+    const mediaCode = el.error?.code;
+    const code = mediaCode ? `MEDIA_ERR_${mediaCode}` : 'unknown';
     const trackId = usePlayer.getState().track?.id ?? '?';
     usePlayer.getState().setPlaying(false);
     if (!noteFailure('media', trackId, code)) return;
-    toast('Playback error — trying next track', 'error');
+    // MEDIA_ERR_SRC_NOT_SUPPORTED (4) with a probed-OK URL usually means the
+    // stream died between probe and play (expiry) — retry once directly
+    // instead of skipping: the next resolveAndLoad re-probes fresh.
+    if (mediaCode === 4 && consecutiveFailures === 1) {
+      const track = usePlayer.getState().track;
+      if (track) {
+        toast('Stream expired — retrying', 'error');
+        const token = ++streamToken;
+        el.removeAttribute('src');
+        el.load();
+        void resolveAndLoad(track, token);
+        return;
+      }
+    }
+    toast(mediaCode === 2 ? 'Network error — trying next track' : 'Playback error — trying next track', 'error');
     next(true);
   };
   el.addEventListener('timeupdate', onTime);

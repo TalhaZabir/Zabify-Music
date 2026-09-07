@@ -149,6 +149,37 @@ before pushing. Apache-2.0.
 | `yt-dlp` failures in API logs | upgrade yt-dlp: `pip install -U yt-dlp` |
 | PWA has no install prompt | needs HTTPS (or localhost) + production build |
 
+### Render: metadata works but nothing plays
+
+This almost always means **stream-URL resolution fails on the server**
+while metadata (search/track) still works. Stream extraction (Innertube
+decipher + `yt-dlp --get-url`) is challenged on datacenter IPs; metadata
+is not. Fix in order:
+
+1. **Check diagnostics:** open `https://<your-api>.onrender.com/api/diag`.
+   `ytdlp.installed` must be `true` and carry a recent version. If
+   `false`, the API was deployed without Python/yt-dlp — redeploy via the
+   Docker blueprint (`render.yaml`), not a plain Node service.
+2. **Check the logs:** Render dashboard → API → Logs. Look for
+   `audio resolve failed` / `stream failed` with
+   `ytdlp-bot-challenge`, `ytdlp-timeout`, or `innertube-no-url`.
+   - `ytdlp-bot-challenge` ("Sign in to confirm you're not a bot") →
+     YouTube flagged the datacenter IP. Strongest fix: set `YTDLP_COOKIES`
+     on the API (paste a fresh YouTube `cookies.txt` body as a secret env
+     var) and redeploy. Weaker fixes the server already tries: alternate
+     player clients + `AUDIO_BLOCKED` retry + quality fallback.
+   - `ytdlp-missing` → `PYTHON_BIN` wrong or non-Docker deploy.
+   - `upstream-403` on `/audio` → expired signature; the server
+     re-resolves once automatically — if it persists, lower the in-app
+     quality to Medium/Low (Settings) and retry.
+3. **Verify wiring:** `VITE_API_BASE_URL` on the **web** service must be
+   `https://<api>.onrender.com/api` and the web must be **rebuilt after**
+   setting it (Vite bakes it in). `CORS_ORIGIN` on the **API** must be the
+   web URL, then redeploy the API. A page-instead-of-audio response means
+   one of these is wrong — the player now says so explicitly.
+4. **Cold starts:** free-tier API sleeps after ~15 min. First play after
+   sleep takes 30–60s (wake + yt-dlp resolve); press play once more.
+
 ## License
 
 Apache-2.0. Music, artwork, and metadata belong to their providers/rights holders.

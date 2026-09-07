@@ -8,6 +8,30 @@ import { sendError, toSafeMessage } from '../utils/errors.js';
 // nothing is stored server-side. Size-capped and timed out.
 const MAX_BYTES = 30 * 1024 * 1024;
 
+const UPSTREAM_UA =
+  process.env.YTDLP_USER_AGENT ??
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+/** Browser-like headers: googlevideo throttles/403s bare Node requests. */
+function upstreamHeaders(range: string): Record<string, string> {
+  return {
+    Range: range,
+    'User-Agent': UPSTREAM_UA,
+    Referer: 'https://music.youtube.com/',
+    Origin: 'https://music.youtube.com',
+    Accept: '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+  };
+}
+
+async function fetchUpstream(url: string, range: string): Promise<Response> {
+  return fetch(url, {
+    headers: upstreamHeaders(range),
+    signal: AbortSignal.timeout(30000),
+    redirect: 'follow',
+  });
+}
+
 const idParam = z.object({ id: z.string().min(1).max(128).regex(/^[^<>"]+$/) });
 const querySchema = z.object({ quality: z.enum(['low', 'medium', 'high', 'auto']).default('high') });
 
@@ -22,15 +46,16 @@ export async function audioRoutes(app: FastifyInstance): Promise<void> {
     let stream;
     try {
       stream = await provider.getStream(p.data.id, { quality: 'high' });
-    } catch {
+    } catch (e) {
+      app.log.error({ err: toSafeMessage(e), trackId: p.data.id }, 'audio probe resolve failed');
       return sendError(reply, 404, 'TRACK_UNAVAILABLE', 'The requested track is currently unavailable.');
     }
     try {
-      const probe = await fetch(stream.url, {
-        headers: { Range: 'bytes=0-0' },
-        signal: AbortSignal.timeout(20000),
-      });
-      if (!probe.ok && probe.status !== 206) return sendError(reply, 502, 'AUDIO_FAILED', 'Audio is temporarily unavailable.');
+      const probe = await fetchUpstream(stream.url, 'bytes=0-0');
+      if (!probe.ok && probe.status !== 206) {
+        app.log.warn({ status: probe.status, trackId: p.data.id }, 'audio probe upstream rejected');
+        return sendError(reply, 502, 'AUDIO_FAILED', 'Audio is temporarily unavailable.');
+      }
       // Drain the single byte so the socket closes cleanly.
       await probe.arrayBuffer().catch(() => undefined);
       const total = probe.headers.get('content-range')?.split('/')[1];
@@ -56,7 +81,8 @@ export async function audioRoutes(app: FastifyInstance): Promise<void> {
     let stream;
     try {
       stream = await provider.getStream(p.data.id, { quality: q.data.quality });
-    } catch {
+    } catch (e) {
+      app.log.error({ err: toSafeMessage(e), trackId: p.data.id }, 'audio resolve failed');
       return sendError(reply, 404, 'TRACK_UNAVAILABLE', 'The requested track is currently unavailable.');
     }
 
@@ -68,17 +94,40 @@ export async function audioRoutes(app: FastifyInstance): Promise<void> {
     // Always range-request upstream: plain (non-range) requests get
     // throttled to a trickle and cut off early by the stream host.
     const upstreamRange = range ?? 'bytes=0-';
+    const resolvedQuality = q.data.quality;
     let upstream: Response;
     try {
-      upstream = await fetch(stream.url, {
-        headers: { Range: upstreamRange },
-        signal: AbortSignal.timeout(30000),
-      });
+      upstream = await fetchUpstream(stream.url, upstreamRange);
     } catch (e) {
-      app.log.error({ err: toSafeMessage(e) }, 'audio proxy fetch failed');
+      app.log.error({ err: toSafeMessage(e), trackId: p.data.id }, 'audio proxy fetch failed');
       return sendError(reply, 502, 'AUDIO_FAILED', 'Audio is temporarily unavailable.');
     }
+    // Stream URLs expire quickly and free-tier resolves are slow: a 403
+    // often means the URL died between resolve and fetch. Re-resolve once
+    // before giving up — this fixes a large share of transient failures.
+    if (upstream.status === 403 || upstream.status === 410) {
+      await upstream.body?.cancel().catch(() => undefined);
+      app.log.warn({ status: upstream.status, trackId: p.data.id }, 'audio upstream expired, re-resolving once');
+      try {
+        const fresh = await provider.getStream(p.data.id, { quality: resolvedQuality });
+        stream = fresh;
+        upstream = await fetchUpstream(stream.url, upstreamRange);
+      } catch (e) {
+        app.log.error({ err: toSafeMessage(e), trackId: p.data.id }, 'audio re-resolve failed');
+        return sendError(reply, 502, 'AUDIO_FAILED', 'Audio is temporarily unavailable.');
+      }
+    }
     if (!upstream.ok && upstream.status !== 206) {
+      app.log.warn(
+        { status: upstream.status, trackId: p.data.id, contentType: upstream.headers.get('content-type') },
+        'audio upstream rejected',
+      );
+      await upstream.body?.cancel().catch(() => undefined);
+      // 403 from googlevideo = IP/blocked or expired signature. Surface a
+      // distinct code so the frontend can explain it (datacenter blocks).
+      if (upstream.status === 403) {
+        return sendError(reply, 502, 'AUDIO_BLOCKED', 'The audio host refused this server. Retry, lower quality, or set YTDLP_COOKIES.');
+      }
       return sendError(reply, 502, 'AUDIO_FAILED', 'Audio is temporarily unavailable.');
     }
 
@@ -106,6 +155,7 @@ export async function audioRoutes(app: FastifyInstance): Promise<void> {
     reply.raw.writeHead(status, {
       'Content-Type': contentType,
       'Accept-Ranges': 'bytes',
+      'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Accept-Ranges',
       ...(acao ? { 'Access-Control-Allow-Origin': acao, Vary: 'Origin' } : {}),
       ...(fullBody
         ? { 'Content-Length': total as string }
