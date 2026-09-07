@@ -175,9 +175,9 @@ async function resolveAndLoad(track: Track, token: number): Promise<void> {
     let resolved: string | null = null;
     let lastMessage = 'That track is unavailable right now';
     let lastCode: string | undefined;
+    let lastTimedOut = false;
     for (const q of chain) {
       if (token !== streamToken) return; // superseded while probing
-       
       const probe = await probeAudio(track.id, q);
       if (probe.ok) {
         resolved = probe.url;
@@ -185,6 +185,7 @@ async function resolveAndLoad(track: Track, token: number): Promise<void> {
       }
       lastMessage = probe.message;
       lastCode = probe.code;
+      lastTimedOut = probe.timedOut ?? false;
       // CORS-unknown: <audio> (no-CORS) may still play — try direct.
       if (probe.corsUnknown) {
         resolved = audioUrl(track.id, q);
@@ -192,13 +193,24 @@ async function resolveAndLoad(track: Track, token: number): Promise<void> {
       }
       // Permanent per-track failures: don't burn time on lower qualities.
       if (probe.code === 'TRACK_UNAVAILABLE' || probe.status === 404 || probe.code === 'HTML_RESPONSE') break;
+      // Server-wide blocks/config/timeouts: lower qualities won't help either —
+      // one probe already told us everything (and each can take ~90s).
+      if (probe.code === 'AUDIO_BLOCKED' || probe.code === 'AUDIO_CONFIG' || probe.timedOut) break;
     }
     if (!resolved) {
       if (token !== streamToken) return;
       usePlayer.getState().setPlaying(false);
-      // AUDIO_BLOCKED / warming-up errors are server-wide: stop the
-      // auto-skip cascade so every track doesn't burn one skip each.
-      if (lastCode === 'AUDIO_BLOCKED' || /warming up or busy/.test(lastMessage)) consecutiveFailures = MAX_AUTO_SKIP;
+      // AUDIO_BLOCKED / AUDIO_CONFIG / warming-up / timeout errors are
+      // server-wide: stop the auto-skip cascade so every track doesn't burn
+      // one skip each.
+      if (
+        lastCode === 'AUDIO_BLOCKED' ||
+        lastCode === 'AUDIO_CONFIG' ||
+        lastTimedOut ||
+        /warming up or busy|taking too long|misconfigured/.test(lastMessage)
+      ) {
+        consecutiveFailures = MAX_AUTO_SKIP;
+      }
       toast(lastMessage, 'error');
       return;
     }

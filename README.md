@@ -149,34 +149,50 @@ before pushing. Apache-2.0.
 | `yt-dlp` failures in API logs | upgrade yt-dlp: `pip install -U yt-dlp` |
 | PWA has no install prompt | needs HTTPS (or localhost) + production build |
 
-### Render: metadata works but nothing plays
+### Render: metadata works but nothing plays (console shows 404)
 
 This almost always means **stream-URL resolution fails on the server**
 while metadata (search/track) still works. Stream extraction (Innertube
 decipher + `yt-dlp --get-url`) is challenged on datacenter IPs; metadata
-is not. Fix in order:
+is not. Localhost works because residential IPs aren't challenged.
 
-1. **Check diagnostics:** open `https://<your-api>.onrender.com/api/diag`.
-   `ytdlp.installed` must be `true` and carry a recent version. If
-   `false`, the API was deployed without Python/yt-dlp — redeploy via the
-   Docker blueprint (`render.yaml`), not a plain Node service.
-2. **Check the logs:** Render dashboard → API → Logs. Look for
+**First — make sure Render is actually running the latest code.**
+`git push`, then wait for **both** Render deploys (API + web) to finish;
+the API Docker build takes several minutes. Render does **not**
+retro-apply new `render.yaml` env vars to services created earlier — if
+your API predates them, add `YTDLP_TIMEOUT_MS=45000` manually in the
+dashboard and redeploy. After redeploying, the API logs must contain a
+`stream backend: yt-dlp <version>` line; if it says NOT FOUND, the
+service isn't using the Dockerfile (recreate it from the blueprint).
+
+Then diagnose in order:
+
+1. **Read the failing request** (DevTools → Network → click the red
+   `audio?quality=…` row):
+   - **Request URL host is your *web* host** (e.g. `zabify-web…/api/…`)
+     → `VITE_API_BASE_URL` isn't set on the web service. Set it to
+     `https://<api>.onrender.com/api` and **redeploy the web** (Vite bakes
+     it in at build time).
+   - **Status 502 + code `AUDIO_BLOCKED`** (or response header
+     `x-resolve-error` containing `ytdlp-bot-challenge`) → YouTube flagged
+     the datacenter IP. Strongest fix: set `YTDLP_COOKIES` on the API
+     (export a fresh YouTube `cookies.txt` via a browser extension and
+     paste the whole file body as a secret env var), then redeploy. The
+     server already tries alternate player clients + Chrome TLS
+     impersonation + quality fallback first.
+   - **Status 404 + code `TRACK_UNAVAILABLE`** → that specific track can't
+     be resolved (deleted/private/region-locked). If *every* track 404s,
+     treat it as the blocked case above and check `/api/diag`.
+   - **`x-resolve-error: ytdlp-missing`** → `PYTHON_BIN` wrong or a
+     non-Docker deploy — recreate the API from the blueprint.
+2. **Check diagnostics:** open `https://<your-api>.onrender.com/api/diag`.
+   `ytdlp.installed` must be `true` with a recent version.
+3. **Check the logs:** Render dashboard → API → Logs. Look for
    `audio resolve failed` / `stream failed` with
    `ytdlp-bot-challenge`, `ytdlp-timeout`, or `innertube-no-url`.
-   - `ytdlp-bot-challenge` ("Sign in to confirm you're not a bot") →
-     YouTube flagged the datacenter IP. Strongest fix: set `YTDLP_COOKIES`
-     on the API (paste a fresh YouTube `cookies.txt` body as a secret env
-     var) and redeploy. Weaker fixes the server already tries: alternate
-     player clients + `AUDIO_BLOCKED` retry + quality fallback.
-   - `ytdlp-missing` → `PYTHON_BIN` wrong or non-Docker deploy.
    - `upstream-403` on `/audio` → expired signature; the server
      re-resolves once automatically — if it persists, lower the in-app
      quality to Medium/Low (Settings) and retry.
-3. **Verify wiring:** `VITE_API_BASE_URL` on the **web** service must be
-   `https://<api>.onrender.com/api` and the web must be **rebuilt after**
-   setting it (Vite bakes it in). `CORS_ORIGIN` on the **API** must be the
-   web URL, then redeploy the API. A page-instead-of-audio response means
-   one of these is wrong — the player now says so explicitly.
 4. **Cold starts:** free-tier API sleeps after ~15 min. First play after
    sleep takes 30–60s (wake + yt-dlp resolve); press play once more.
 

@@ -107,9 +107,34 @@ export const useSettings = create<SettingsState>()(
     }),
     {
       name: 'zabify-settings',
+      version: 1,
+      // Migration for Render redeploys: the baked VITE_API_BASE_URL is fixed
+      // AFTER the first deploy (static hosts bake it at build time), but the
+      // old wrong value (usually "/api") is already persisted in browsers.
+      // Without this, fixing the env + redeploying never fixes existing
+      // browsers — they keep hitting the stale base until "Reset to defaults".
+      migrate: (persisted: unknown) => {
+        const baked = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? '/api';
+        const state = (persisted as { state?: Record<string, unknown> } | null)?.state;
+        if (state && typeof state.apiPrimary === 'string') {
+          const stored = state.apiPrimary.trim();
+          // Stored relative "/api" is only correct when served same-origin
+          // (Docker nginx). On a static host (Render) with an absolute baked
+          // URL, the stored relative value is stale from the first deploy.
+          if (stored === '/api' && baked.startsWith('http')) {
+            state.apiPrimary = baked;
+          }
+        }
+        return persisted as never;
+      },
       onRehydrateStorage: () => (s) => {
         if (s) {
           applyTheme(s.accent, s.background);
+          // Same stale-base guard for stores that bypass migrate (same version).
+          const baked = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? '/api';
+          if (s.apiPrimary.trim() === '/api' && baked.startsWith('http') && !s.useCustomApi) {
+            s.apiPrimary = baked;
+          }
           applyApiBases(s);
         }
       },

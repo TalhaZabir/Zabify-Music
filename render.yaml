@@ -32,6 +32,8 @@ services:
         value: python3
       - key: YTDLP_TIMEOUT_MS
         value: "45000"
+      - key: YTDLP_IMPERSONATE
+        value: chrome
       - key: LOG_LEVEL
         value: info
       # Optional reliability upgrades (all sync:false — set in dashboard):

@@ -43,10 +43,37 @@ function attemptsFor(quality: StreamOptions['quality']): Attempt[] {
     // Android returns non-SABR URLs without a PO token (often itag 18
     // video/mp4 — still playable, slightly larger). Accepts any format.
     { name: 'android', extractorArgs: 'youtube:player_client=android', format: 'bestaudio/best' },
-    // iOS + mweb are additional fallbacks for heavily-flagged IPs.
+    // iOS + mweb + tv are additional fallbacks for heavily-flagged IPs.
+    // tv is frequently the most permissive on datacenter IPs.
     { name: 'ios', extractorArgs: 'youtube:player_client=ios', format: 'bestaudio/best' },
     { name: 'mweb', extractorArgs: 'youtube:player_client=mweb', format: 'bestaudio/best' },
+    { name: 'tv', extractorArgs: 'youtube:player_client=tv', format: 'bestaudio/best' },
   ];
+}
+
+/**
+ * Decode YTDLP_COOKIES env. Accepts either raw Netscape cookies.txt body
+ * (contains tabs / "# HTTP") or base64 of that file (single-line, safe for
+ * dashboards that strip newlines). Returns null when unset.
+ */
+function cookiesContent(): string | null {
+  const raw = (process.env.YTDLP_COOKIES ?? '').trim();
+  if (!raw) return null;
+  if (raw.includes('\n') || raw.includes('\t') || raw.includes('# HTTP') || raw.includes('.youtube.com')) {
+    return raw;
+  }
+  // Heuristic: single-line base64 without cookie markers — try to decode.
+  if (/^[A-Za-z0-9+/=\s]+$/.test(raw) && raw.replace(/\s/g, '').length % 4 === 0) {
+    try {
+      const decoded = Buffer.from(raw.replace(/\s/g, ''), 'base64').toString('utf8');
+      if (decoded.includes('.youtube.com') || decoded.includes('# HTTP') || decoded.includes('\t')) {
+        return decoded;
+      }
+    } catch {
+      // fall through to raw
+    }
+  }
+  return raw;
 }
 
 function extraArgs(): string[] {
@@ -75,7 +102,14 @@ function extraArgs(): string[] {
   return out.filter((a) => a.startsWith('-') && !a.includes('\n') && !a.includes('\0')).slice(0, 20);
 }
 
-export async function resolveWithYtDlp(trackId: string, options?: StreamOptions): Promise<{ url: string; expiresAt: number }> {
+export interface YtDlpResolution {
+  url: string;
+  expiresAt: number;
+  /** Attempt name that succeeded ("default" | "android" | "ios" | "mweb" | "tv"). */
+  via: string;
+}
+
+export async function resolveWithYtDlp(trackId: string, options?: StreamOptions): Promise<YtDlpResolution> {
   if (!/^[A-Za-z0-9_-]{5,32}$/u.test(trackId)) throw new Error('INVALID_ID');
   const attempts = attemptsFor(options?.quality);
   let lastErr: unknown = null;
@@ -97,7 +131,7 @@ async function resolveOnce(
   trackId: string,
   options: StreamOptions | undefined,
   attempt: Attempt,
-): Promise<{ url: string; expiresAt: number }> {
+): Promise<YtDlpResolution> {
   const python = process.env.PYTHON_BIN ?? 'python';
   const timeoutMs = Number(process.env.YTDLP_TIMEOUT_MS ?? 25000);
   const url = `https://music.youtube.com/watch?v=${trackId}`;
@@ -116,11 +150,27 @@ async function resolveOnce(
     '--user-agent',
     process.env.YTDLP_USER_AGENT ?? BROWSER_UA,
   ];
+  // TLS impersonation (curl_cffi) makes datacenter requests look like real
+  // Chrome traffic and defeats a large share of bot challenges. The Docker
+  // image ships curl_cffi; local dev may not have it — detected once.
+  const impersonate = await impersonateTarget(python);
+  if (impersonate) args.push('--impersonate', impersonate);
   if (attempt.extractorArgs) args.push('--extractor-args', attempt.extractorArgs);
-  const cookies = (process.env.YTDLP_COOKIES ?? '').trim();
+  // Forward Innertube session hardening to yt-dlp so both resolvers benefit
+  // from the same secrets. Multiple --extractor-args flags are merged.
+  const poToken = (process.env.YT_PO_TOKEN ?? '').trim();
+  if (poToken) args.push('--extractor-args', `youtube:po_token=${poToken}`);
+  const visitorData = (process.env.YT_VISITOR_DATA ?? '').trim();
+  if (visitorData) args.push('--extractor-args', `youtube:visitor_data=${visitorData}`);
+  // Single login cookie (YT_COOKIE="SAPISID=...; ...") when no full
+  // cookies.txt is configured — sent as an HTTP Cookie header.
+  const singleCookie = (process.env.YT_COOKIE ?? '').trim();
+  const cookies = cookiesContent();
+  if (singleCookie && !cookies) args.push('--add-header', `Cookie:${singleCookie}`);
   if (cookies) {
     // Raw Netscape cookie file contents via env (Render secret file pattern:
-    // paste the cookies.txt body). Written to a temp file, never logged.
+    // paste the cookies.txt body or its base64). Written to a temp file,
+    // never logged.
     const { writeFile, unlink } = await import('node:fs/promises');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
@@ -128,14 +178,19 @@ async function resolveOnce(
     const path = join(tmpdir(), `zabify-cookies-${randomUUID()}.txt`);
     await writeFile(path, cookies, 'utf8');
     args.push('--cookies', path);
+    // NOTE: extraArgs must still apply when cookies are set (previously
+    // dropped here, silently ignoring YTDLP_EXTRA_ARGS).
+    args.push(...extraArgs());
     try {
-      return await runYtDlp(python, args, url, timeoutMs);
+      const resolved = await runYtDlp(python, args, url, timeoutMs);
+      return { ...resolved, via: attempt.name };
     } finally {
       await unlink(path).catch(() => undefined);
     }
   }
   args.push(...extraArgs(), url);
-  return runYtDlp(python, args, url, timeoutMs);
+  const resolved = await runYtDlp(python, args, url, timeoutMs);
+  return { ...resolved, via: attempt.name };
 }
 
 function runYtDlp(python: string, args: string[], url: string, timeoutMs: number): Promise<{ url: string; expiresAt: number }> {
@@ -205,4 +260,81 @@ export async function ytDlpVersion(): Promise<{ installed: boolean; version?: st
 
 export function ytDlpEnabled(): boolean {
   return (process.env.YTDLP_ENABLED ?? 'true').toLowerCase() !== 'false';
+}
+
+let impersonateCache: { python: string; target: string | null } | null = null;
+
+/**
+ * Chrome TLS impersonation target when curl_cffi is installed, else null.
+ * Result is cached per PYTHON_BIN — never throws, never blocks long.
+ */
+async function impersonateTarget(python: string): Promise<string | null> {
+  if (impersonateCache && impersonateCache.python === python) return impersonateCache.target;
+  // Explicit opt-out (e.g. minimal hosts where the flag breaks old yt-dlp).
+  if ((process.env.YTDLP_IMPERSONATE ?? '').toLowerCase() === 'false') {
+    impersonateCache = { python, target: null };
+    return null;
+  }
+  const target = (process.env.YTDLP_IMPERSONATE ?? 'chrome').trim() || 'chrome';
+  try {
+    await new Promise<void>((resolve, reject) => {
+      execFile(python, ['-c', 'import curl_cffi'], { timeout: 15000 }, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+    impersonateCache = { python, target };
+    return target;
+  } catch {
+    impersonateCache = { python, target: null };
+    return null;
+  }
+}
+
+/**
+ * True when a resolve failure means "YouTube is blocking/rate-limiting this
+ * server" rather than "this track doesn't exist". Routes map this to 502
+ * AUDIO_BLOCKED so clients can explain it; everything else stays 404.
+ *
+ * Covers bot-challenge, rate limits, upstream 403s, timeouts under challenge,
+ * and SABR/PO-token failures that all mean "server IP flagged", not "bad id".
+ */
+export function isUpstreamBlocked(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return /ytdlp-bot-challenge|rate-limited|upstream-403|ytdlp-timeout|innertube-timeout|PO token|SABR/i.test(msg);
+}
+
+/** True when yt-dlp is missing/misconfigured (distinct from blocked vs gone). */
+export function isYtDlpMissing(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return /ytdlp-missing|ytdlp disabled/i.test(msg);
+}
+
+/**
+ * Fire-and-forget yt-dlp self-update, called once after the server starts
+ * listening. Never delays startup or readiness: YouTube breaks pinned
+ * yt-dlp versions within weeks, and free-tier images can sit undeployed for
+ * months. Disable with YTDLP_AUTO_UPDATE=false.
+ */
+export function maybeRefreshYtDlp(log?: (msg: string) => void): void {
+  if ((process.env.YTDLP_AUTO_UPDATE ?? 'true').toLowerCase() === 'false') return;
+  if (!ytDlpEnabled()) return;
+  const python = process.env.PYTHON_BIN ?? 'python';
+  try {
+    const child = execFile(
+      python,
+      ['-m', 'pip', 'install', '-q', '--disable-pip-version-check', '--break-system-packages', '-U', 'yt-dlp'],
+      { timeout: 180000, maxBuffer: 1024 * 1024 },
+      (err) => {
+        if (err) log?.(`yt-dlp auto-update skipped: ${String(err.message).slice(0, 120)}`);
+        else {
+          cachedVersion = null;
+          log?.('yt-dlp auto-update finished');
+        }
+      },
+    );
+    child.unref?.();
+  } catch {
+    // best-effort only
+  }
 }

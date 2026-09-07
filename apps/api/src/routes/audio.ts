@@ -1,7 +1,10 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { YouTubeMusicProvider } from '../providers/ytmusic/provider.js';
+import { resolveDetail } from '../providers/ytmusic/provider.js';
+import { isUpstreamBlocked, isYtDlpMissing } from '../providers/ytmusic/ytdlp.js';
 import { sendError, toSafeMessage } from '../utils/errors.js';
+import type { StreamInfo } from '@zabify/shared';
 
 // Same-origin audio proxy for user-initiated offline caching.
 // Only raw bytes are relayed — upstream stream URLs are never exposed and
@@ -35,6 +38,85 @@ async function fetchUpstream(url: string, range: string): Promise<Response> {
 const idParam = z.object({ id: z.string().min(1).max(128).regex(/^[^<>"]+$/) });
 const querySchema = z.object({ quality: z.enum(['low', 'medium', 'high', 'auto']).default('high') });
 
+// Short-lived resolve cache: the frontend probes (Range bytes=0-0) and then
+// immediately plays the SAME proxy URL, which would otherwise trigger two
+// full Innertube+yt-dlp resolves. Caching the upstream URL for ~2 min halves
+// Render load/latency and halves the chance of expiry between probe and play.
+// Only successful resolves are cached; failures are never cached. Upstream
+// URLs live 5-30 min, so a 2 min cache is safely inside expiry.
+const RESOLVE_TTL_MS = 120_000;
+const resolveCache = new Map<string, { stream: StreamInfo; cachedAt: number }>();
+const inflight = new Map<string, Promise<StreamInfo>>();
+
+function resolveKey(id: string, quality: string): string {
+  return `${id}:${quality}`;
+}
+
+function getCachedResolve(id: string, quality: string): StreamInfo | null {
+  const hit = resolveCache.get(resolveKey(id, quality));
+  if (!hit) return null;
+  if (Date.now() - hit.cachedAt > RESOLVE_TTL_MS) {
+    resolveCache.delete(resolveKey(id, quality));
+    return null;
+  }
+  // Don't reuse a URL that is about to expire (30s safety margin).
+  if (hit.stream.expiresAt && hit.stream.expiresAt < Date.now() + 30_000) {
+    resolveCache.delete(resolveKey(id, quality));
+    return null;
+  }
+  return hit.stream;
+}
+
+/** Deduplicates concurrent resolves for the same track+quality. */
+async function cachedGetStream(
+  provider: YouTubeMusicProvider,
+  id: string,
+  quality: 'low' | 'medium' | 'high' | 'auto',
+): Promise<StreamInfo> {
+  const cached = getCachedResolve(id, quality);
+  if (cached) return cached;
+  const key = resolveKey(id, quality);
+  const ongoing = inflight.get(key);
+  if (ongoing) return ongoing;
+  const task = provider
+    .getStream(id, { quality })
+    .then((stream) => {
+      resolveCache.set(key, { stream, cachedAt: Date.now() });
+      // Bound memory on long-lived servers.
+      if (resolveCache.size > 500) {
+        const oldest = resolveCache.keys().next().value;
+        if (oldest) resolveCache.delete(oldest);
+      }
+      return stream;
+    })
+    .finally(() => {
+      inflight.delete(key);
+    });
+  inflight.set(key, task);
+  return task;
+}
+
+/** Map resolve failures to the right public status (parity for HEAD + GET). */
+function resolveErrorReply(reply: FastifyReply, e: unknown) {
+  if (isYtDlpMissing(e)) {
+    return sendError(
+      reply,
+      502,
+      'AUDIO_CONFIG',
+      'Audio backend is misconfigured (yt-dlp missing). The host must deploy the API from the Dockerfile.',
+    );
+  }
+  if (isUpstreamBlocked(e)) {
+    return sendError(
+      reply,
+      502,
+      'AUDIO_BLOCKED',
+      'YouTube is blocking or rate-limiting this server. Retry, lower quality, or set YTDLP_COOKIES.',
+    );
+  }
+  return sendError(reply, 404, 'TRACK_UNAVAILABLE', 'The requested track is currently unavailable.');
+}
+
 export async function audioRoutes(app: FastifyInstance): Promise<void> {
   const provider = new YouTubeMusicProvider();
 
@@ -45,10 +127,12 @@ export async function audioRoutes(app: FastifyInstance): Promise<void> {
     if (!p.success) return sendError(reply, 400, 'INVALID_ID', 'Invalid track id.');
     let stream;
     try {
-      stream = await provider.getStream(p.data.id, { quality: 'high' });
+      stream = await cachedGetStream(provider, p.data.id, 'high');
     } catch (e) {
       app.log.error({ err: toSafeMessage(e), trackId: p.data.id }, 'audio probe resolve failed');
-      return sendError(reply, 404, 'TRACK_UNAVAILABLE', 'The requested track is currently unavailable.');
+      void reply.header('x-resolve-error', resolveDetail(e));
+      void reply.header('Access-Control-Expose-Headers', 'x-resolve-error');
+      return resolveErrorReply(reply, e);
     }
     try {
       const probe = await fetchUpstream(stream.url, 'bytes=0-0');
@@ -80,10 +164,15 @@ export async function audioRoutes(app: FastifyInstance): Promise<void> {
 
     let stream;
     try {
-      stream = await provider.getStream(p.data.id, { quality: q.data.quality });
+      stream = await cachedGetStream(provider, p.data.id, q.data.quality);
     } catch (e) {
       app.log.error({ err: toSafeMessage(e), trackId: p.data.id }, 'audio resolve failed');
-      return sendError(reply, 404, 'TRACK_UNAVAILABLE', 'The requested track is currently unavailable.');
+      void reply.header('x-resolve-error', resolveDetail(e));
+      void reply.header('Access-Control-Expose-Headers', 'x-resolve-error');
+      // A blocked/misconfigured server is NOT a missing track: 502 tells
+      // the client to explain cookies/region instead of skipping blindly.
+      // Plain 404 stays for genuinely unavailable tracks.
+      return resolveErrorReply(reply, e);
     }
 
     const range = req.headers.range;
@@ -109,7 +198,10 @@ export async function audioRoutes(app: FastifyInstance): Promise<void> {
       await upstream.body?.cancel().catch(() => undefined);
       app.log.warn({ status: upstream.status, trackId: p.data.id }, 'audio upstream expired, re-resolving once');
       try {
-        const fresh = await provider.getStream(p.data.id, { quality: resolvedQuality });
+        // Bypass the cache: the cached URL is the one that just expired.
+        resolveCache.delete(resolveKey(p.data.id, resolvedQuality));
+        inflight.delete(resolveKey(p.data.id, resolvedQuality));
+        const fresh = await cachedGetStream(provider, p.data.id, resolvedQuality);
         stream = fresh;
         upstream = await fetchUpstream(stream.url, upstreamRange);
       } catch (e) {
@@ -155,7 +247,8 @@ export async function audioRoutes(app: FastifyInstance): Promise<void> {
     reply.raw.writeHead(status, {
       'Content-Type': contentType,
       'Accept-Ranges': 'bytes',
-      'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Accept-Ranges',
+      'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Accept-Ranges, X-Resolve-Via',
+      'X-Resolve-Via': stream.via ?? 'unknown',
       ...(acao ? { 'Access-Control-Allow-Origin': acao, Vary: 'Origin' } : {}),
       ...(fullBody
         ? { 'Content-Length': total as string }

@@ -23,7 +23,7 @@ async function req<T>(path: string): Promise<T> {
 
 export type AudioProbe =
   | { ok: true; url: string; quality: StreamQuality }
-  | { ok: false; status?: number; code?: string; message: string; corsUnknown?: boolean };
+  | { ok: false; url: string; status?: number; code?: string; message: string; corsUnknown?: boolean; timedOut?: boolean };
 
 /** Quality fallback chain: requested first, then progressively cheaper. */
 export function qualityChain(requested: StreamQuality): StreamQuality[] {
@@ -49,39 +49,57 @@ export function audioUrl(id: string, quality: StreamQuality = 'auto'): string {
  * MEDIA_ERR_SRC_NOT_SUPPORTED and the player blindly skips tracks.
  * A CORS TypeError is reported as corsUnknown — the <audio> element
  * (no-CORS mode) may still play, so callers fall back to direct play.
+ *
+ * Free-tier servers sleep and yt-dlp resolves are slow: the probe waits up
+ * to 90s. An abort surfaces as timedOut ("server may be waking up").
  */
+const PROBE_TIMEOUT_MS = 90000;
+
 export async function probeAudio(id: string, quality: StreamQuality): Promise<AudioProbe> {
   const url = audioUrl(id, quality);
+  const fail = (p: { status?: number; code?: string; message: string; corsUnknown?: boolean; timedOut?: boolean }): AudioProbe => {
+    const out: AudioProbe = { ok: false, url, ...p };
+    console.warn('[zabify] audio probe failed', { url, status: p.status, code: p.code });
+    return out;
+  };
+  const ctrl = new AbortController();
+  const timer = window.setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
   let res: Response;
   try {
-    res = await fetch(url, { headers: { Range: 'bytes=0-0' } });
-  } catch {
-    return { ok: false, message: 'Network error reaching the audio server.', corsUnknown: true };
+    res = await fetch(url, { headers: { Range: 'bytes=0-0' }, signal: ctrl.signal });
+  } catch (e) {
+    window.clearTimeout(timer);
+    if (e instanceof DOMException && e.name === 'AbortError') {
+      return fail({
+        timedOut: true,
+        message: 'The audio server is taking too long (it may be waking up) — press play to retry',
+      });
+    }
+    return fail({ message: 'Network error reaching the audio server.', corsUnknown: true });
   }
+  window.clearTimeout(timer);
   if (res.ok || res.status === 206 || res.status === 200) {
     const ct = res.headers.get('content-type') ?? '';
     // Drain the 2-byte probe body so sockets close cleanly.
     await res.arrayBuffer().catch(() => undefined);
     if (/^(audio\/|video\/mp4)/.test(ct)) return { ok: true, url, quality };
     if (ct.includes('text/html')) {
-      return {
-        ok: false,
+      return fail({
         status: res.status,
         code: 'HTML_RESPONSE',
         message: 'API returned a page instead of audio — check VITE_API_BASE_URL points at the backend /api.',
-      };
+      });
     }
     // Unexpected content type — still let <audio> try; it reports the truth.
     return { ok: true, url, quality };
   }
   const ct = res.headers.get('content-type') ?? '';
   if (ct.includes('text/html')) {
-    return {
-      ok: false,
+    return fail({
       status: res.status,
       code: 'HTML_RESPONSE',
       message: 'API returned a page instead of audio — check VITE_API_BASE_URL points at the backend /api.',
-    };
+    });
   }
   let code: string | undefined;
   let serverMessage: string | undefined;
@@ -92,13 +110,20 @@ export async function probeAudio(id: string, quality: StreamQuality): Promise<Au
   } catch {
     // non-JSON error body — fall through to status-based message
   }
-  return { ok: false, status: res.status, code, message: messageForAudioError(res.status, code, serverMessage) };
+  // Surface the server's resolve token (x-resolve-error) in the console so a
+  // remote 404/502 can be diagnosed without server log access.
+  const resolveErr = res.headers.get('x-resolve-error');
+  if (resolveErr) console.warn('[zabify] server resolve detail', { url, resolveErr });
+  return fail({ status: res.status, code, message: messageForAudioError(res.status, code, serverMessage) });
 }
 
 function messageForAudioError(status: number, code?: string, serverMessage?: string): string {
   if (code === 'TRACK_UNAVAILABLE' || status === 404) return 'That track is unavailable right now';
   if (code === 'AUDIO_BLOCKED') {
-    return 'YouTube is blocking this server (datacenter IP). Try a lower quality, or ask the host to set YTDLP_COOKIES.';
+    return 'YouTube is blocking or rate-limiting this server. Try a lower quality, wait a minute, or ask the host to set YTDLP_COOKIES.';
+  }
+  if (code === 'AUDIO_CONFIG') {
+    return 'Audio backend is misconfigured (yt-dlp missing) — the API must be deployed from the Dockerfile. Check /api/diag.';
   }
   if (code === 'AUDIO_TOO_LARGE') return 'That track is too large to stream through this server';
   if (code === 'INVALID_RANGE') return 'Seek failed — retrying';

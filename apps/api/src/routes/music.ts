@@ -1,7 +1,8 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { TtlCache } from '../cache/lru.js';
-import { YouTubeMusicProvider } from '../providers/ytmusic/provider.js';
+import { YouTubeMusicProvider, resolveDetail } from '../providers/ytmusic/provider.js';
+import { isUpstreamBlocked, isYtDlpMissing } from '../providers/ytmusic/ytdlp.js';
 import { sendError, toSafeMessage } from '../utils/errors.js';
 import type { Env } from '../env.js';
 
@@ -61,6 +62,24 @@ export async function musicRoutes(app: FastifyInstance, env: Env): Promise<void>
       return reply.send(s);
     } catch (e) {
       app.log.error({ err: toSafeMessage(e), trackId: p.data.id }, 'stream failed');
+      void reply.header('x-resolve-error', resolveDetail(e));
+      void reply.header('Access-Control-Expose-Headers', 'x-resolve-error');
+      if (isYtDlpMissing(e)) {
+        return sendError(
+          reply,
+          502,
+          'AUDIO_CONFIG',
+          'Audio backend is misconfigured (yt-dlp missing). The host must deploy the API from the Dockerfile.',
+        );
+      }
+      if (isUpstreamBlocked(e)) {
+        return sendError(
+          reply,
+          502,
+          'AUDIO_BLOCKED',
+          'YouTube is blocking or rate-limiting this server. Retry, lower quality, or set YTDLP_COOKIES.',
+        );
+      }
       return sendError(reply, 404, 'TRACK_UNAVAILABLE', 'The requested track is currently unavailable.');
     }
   });

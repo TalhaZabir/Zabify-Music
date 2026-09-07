@@ -107,6 +107,8 @@ export interface StreamInfo {
   bitrate?: number;
   /** Epoch ms when the URL expires. Never persist beyond this. */
   expiresAt?: number;
+  /** Which resolver produced the URL (e.g. "innertube", "ytdlp-default"). Debug aid. */
+  via?: string;
 }
 
 export interface HomeSection<T = Track | Album | Playlist | Artist> {

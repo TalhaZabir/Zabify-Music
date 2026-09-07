@@ -418,8 +418,8 @@ export class YouTubeMusicProvider implements MusicProvider {
     }
     if (ytDlpEnabled()) {
       try {
-        const { url, expiresAt } = await resolveWithYtDlp(trackId, options);
-        return { trackId, url, mimeType: 'audio/mp4', expiresAt };
+        const { url, expiresAt, via } = await resolveWithYtDlp(trackId, options);
+        return { trackId, url, mimeType: 'audio/mp4', expiresAt, via: `ytdlp-${via}` };
       } catch (e) {
         // Preserve both stages for route-level logging. The public error
         // stays generic (TRACK_UNAVAILABLE) to avoid leaking internals.
@@ -433,16 +433,17 @@ export class YouTubeMusicProvider implements MusicProvider {
   private async getStreamViaInnertube(trackId: string, options?: StreamOptions): Promise<StreamInfo | null> {
     const yt = await this.client();
     const poToken = (process.env.YT_PO_TOKEN ?? '').trim() || undefined;
-    // Try the default client first, then explicit fallbacks. ANDROID-class
-    // clients historically return non-SABR URLs that decipher without a
-    // PO token; WEB needs one. Order matters for quality + reliability.
-    const clients = [undefined, 'ANDROID', 'YTMUSIC_ANDROID', 'WEB'] as const;
+    // Datacenter IPs (Render/Fly) are challenged on WEB first: ANDROID-class
+    // clients historically return non-SABR URLs that decipher without a PO
+    // token. Try the most permissive clients first so a blocked server fails
+    // fast (≈12s) instead of burning 20s on WEB before falling back.
+    // Order matters for reliability; quality selection happens per-client.
+    const clients = ['ANDROID', 'YTMUSIC_ANDROID', undefined, 'WEB'] as const;
     let lastErr: unknown = null;
     for (const client of clients) {
       let info;
       try {
-         
-        info = await withTimeout(20000, () =>
+        info = await withTimeout(12000, () =>
           yt.getBasicInfo(trackId, { ...(client ? { client } : {}), ...(poToken ? { po_token: poToken } : {}) }),
         );
       } catch (e) {
@@ -469,14 +470,13 @@ export class YouTubeMusicProvider implements MusicProvider {
         }
       }
       try {
-         
-        const url: string = await withTimeout(15000, () => fmt.decipher(yt.session.player));
+        const url: string = await withTimeout(8000, () => fmt.decipher(yt.session.player));
         if (!url) {
           lastErr = new Error('INNERTUBE_EMPTY_URL');
           continue;
         }
         // Never cache beyond expiry — caller must treat as short-lived.
-        return { trackId, url, mimeType: fmt.mime_type, bitrate: fmt.bitrate, expiresAt: Date.now() + 5 * 60_000 };
+        return { trackId, url, mimeType: fmt.mime_type, bitrate: fmt.bitrate, expiresAt: Date.now() + 5 * 60_000, via: 'innertube' };
       } catch (e) {
         lastErr = e;
         continue;
@@ -535,10 +535,13 @@ function toStage(e: unknown): string {
   const head = msg.split('\n')[0]?.slice(0, 160) ?? '';
   if (/UPSTREAM_TIMEOUT/.test(head)) return 'innertube-timeout';
   if (/No valid URL to decipher|INNERTUBE_NO_URL|INNERTUBE_EMPTY_URL/.test(head)) return 'innertube-no-url';
+  if (/PO.?token|SABR/i.test(head)) return 'innertube-po-token';
   if (/YTDLP_FAILED/.test(head)) {
-    if (/bot/i.test(head)) return 'ytdlp-bot-challenge';
+    if (/bot|sign in to confirm|cookies/i.test(head)) return 'ytdlp-bot-challenge';
     if (/timed out|ETIMEDOUT|timeout/i.test(head)) return 'ytdlp-timeout';
     if (/No module named|not found|ENOENT/i.test(head)) return 'ytdlp-missing';
+    if (/403|forbidden/i.test(head)) return 'upstream-403';
+    if (/429|too many requests/i.test(head)) return 'rate-limited';
     return 'ytdlp-failed';
   }
   if (/YTDLP_NO_URL/.test(head)) return 'ytdlp-no-url';
@@ -546,5 +549,20 @@ function toStage(e: unknown): string {
   if (/403/.test(head)) return 'upstream-403';
   if (/429/.test(head)) return 'rate-limited';
   return head.replace(/[^A-Za-z0-9-_:. ]/g, '').slice(0, 80) || 'failed';
+}
+
+/**
+ * Header-safe resolve-failure summary for `x-resolve-error` (no URLs,
+ * cookies, or stack traces). Lets anyone debug a remote deploy from the
+ * browser Network tab: e.g. "innertube-no-url | ytdlp-bot-challenge".
+ */
+export function resolveDetail(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  const inner = msg.match(/\(([^()]*)\)/)?.[1] ?? msg.split('\n')[0] ?? '';
+  return inner
+    .replace(/[^A-Za-z0-9_| .:-]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
 }
 

@@ -11,7 +11,11 @@ COPY apps/api apps/api
 RUN npm run build -w packages/shared && npm run build -w apps/api
 
 FROM node:24-alpine AS runtime
-RUN apk add --no-cache python3 py3-pip && pip install --no-cache-dir --break-system-packages yt-dlp
+# yt-dlp for stream-URL resolution + curl_cffi for Chrome TLS impersonation
+# (defeats a large share of datacenter bot challenges). The server refreshes
+# yt-dlp itself in the background after boot (see maybeRefreshYtDlp), so the
+# image never goes stale between deploys.
+RUN apk add --no-cache python3 py3-pip && pip install --no-cache-dir --break-system-packages yt-dlp curl_cffi
 ENV NODE_ENV=production PYTHON_BIN=python3
 WORKDIR /app
 COPY --from=build /app/packages/shared/dist packages/shared/dist
@@ -20,7 +24,4 @@ COPY --from=build /app/apps/api/dist apps/api/dist
 COPY --from=build /app/apps/api/package.json apps/api/
 COPY --from=build /app/node_modules node_modules
 EXPOSE 8788
-# Refresh yt-dlp on every boot: YouTube breaks pinned versions within weeks,
-# and Render free-tier images can sit undeployed for months. Best-effort —
-# the API still starts if the upgrade fails (offline mirror, etc.).
-CMD ["sh", "-c", "pip install -q --break-system-packages -U yt-dlp >/dev/null 2>&1 || true; node apps/api/dist/index.js"]
+CMD ["node", "apps/api/dist/index.js"]
