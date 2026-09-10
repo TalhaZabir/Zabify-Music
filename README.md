@@ -173,13 +173,15 @@ Then diagnose in order:
      → `VITE_API_BASE_URL` isn't set on the web service. Set it to
      `https://<api>.onrender.com/api` and **redeploy the web** (Vite bakes
      it in at build time).
-   - **Status 502 + code `AUDIO_BLOCKED`** (or response header
-     `x-resolve-error` containing `ytdlp-bot-challenge`) → YouTube flagged
-     the datacenter IP. Strongest fix: set `YTDLP_COOKIES` on the API
-     (export a fresh YouTube `cookies.txt` via a browser extension and
-     paste the whole file body as a secret env var), then redeploy. The
-     server already tries alternate player clients + Chrome TLS
-     impersonation + quality fallback first.
+    - **Status 502 + code `AUDIO_BLOCKED`** (or response header
+      `x-resolve-error` containing `ytdlp-bot-challenge`) → YouTube flagged
+      the datacenter IP. Strongest fix: set `YTDLP_COOKIES` on the API.
+      Export a fresh YouTube `cookies.txt` ("Get cookies.txt LOCALLY"
+      extension, on youtube.com while logged in), then run
+      `npm run cookies:encode -- <path-to-cookies.txt>` and paste the
+      printed single line as the `YTDLP_COOKIES` secret env var (raw file
+      body works too), then redeploy. The server already tries alternate
+      player clients + Chrome TLS impersonation + quality fallback first.
    - **Status 404 + code `TRACK_UNAVAILABLE`** → that specific track can't
      be resolved (deleted/private/region-locked). If *every* track 404s,
      treat it as the blocked case above and check `/api/diag`.

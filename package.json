@@ -18,7 +18,8 @@
     "typecheck": "npm run typecheck -w packages/shared && npm run typecheck -w apps/api && npm run typecheck -w apps/web",
     "lint": "eslint . --max-warnings 0",
     "test": "npm run test -w packages/shared --if-present && npm run test -w apps/api --if-present && npm run test -w apps/web --if-present",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "cookies:encode": "node scripts/encode-cookies.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
